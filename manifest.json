@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "FetchMap – Sitemap Fetcher",
+  "version": "1.1.0",
+  "description": "Discover and fetch the XML sitemap of the website you are viewing. Browse, filter and export every URL.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Fetch sitemap",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["activeTab", "tabs"],
+  "host_permissions": ["<all_urls>"]
+}

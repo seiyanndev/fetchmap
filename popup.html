@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>FetchMap</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img class="logo" src="icons/logo-mark.png" alt="" width="22" height="22">
+    <h1>Fetch<span>Map</span></h1>
+    <span id="origin" class="origin"></span>
+  </header>
+
+  <section class="controls">
+    <form id="manual-form">
+      <input id="manual-url" type="url" placeholder="Sitemap URL (optional – auto-detected)">
+      <button type="submit" id="fetch-btn">Fetch</button>
+    </form>
+    <div id="status" class="status"></div>
+  </section>
+
+  <section id="sitemaps-section" hidden>
+    <details>
+      <summary>Sitemaps found: <strong id="sitemap-count">0</strong></summary>
+      <ul id="sitemap-list"></ul>
+    </details>
+  </section>
+
+  <section id="results" hidden>
+    <div class="toolbar">
+      <input id="filter" type="search" placeholder="Filter URLs…">
+      <span id="url-count" class="muted"></span>
+    </div>
+    <div class="toolbar">
+      <div class="segmented" role="group" aria-label="View">
+        <button id="view-list" aria-pressed="true">List</button>
+        <button id="view-tree" aria-pressed="false">Tree</button>
+      </div>
+      <div id="tree-tools" class="tree-tools" hidden>
+        <button id="expand-btn">Expand all</button>
+        <button id="collapse-btn">Collapse all</button>
+      </div>
+    </div>
+    <div class="toolbar actions">
+      <button id="copy-btn">Copy</button>
+      <button id="txt-btn">TXT</button>
+      <button id="csv-btn">CSV</button>
+      <button id="json-btn">JSON</button>
+    </div>
+    <ul id="url-list"></ul>
+    <ul id="url-tree" class="tree" hidden></ul>
+  </section>
+
+  <script src="sitemap.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
