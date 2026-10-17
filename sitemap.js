@@ -174,18 +174,47 @@
     try { return decodeURIComponent(s); } catch (_) { return s; }
   }
 
-  // Builds a hierarchy from page URLs. Sitemaps carry no parent/child data, so the
-  // structure comes from URL paths: root -> host -> path segments (-> ?query).
-  // Path levels with no URL of their own become virtual nodes (page: null).
-  // Node: { name, href, parent, depth, page, children: [], total } where depth is 0
-  // for hosts and total counts pages in the subtree including the node itself.
+  // Tree node shared by both tree sources:
+  //   name    display label (path segment, menu text or host)
+  //   href    URL this level stands for (constructed for virtual path levels)
+  //   link    URL to open, or '' for virtual levels and label-only menu headings
+  //   page    the sitemap entry for this node, or null if it is not in the sitemap
+  //   inNav   true if the node is in the site's main navigation menu
+  //   source  'path' (from URL paths), 'nav' (menu) or 'content' (deep scan)
+  //   order   menu position; path-derived children sort by name after menu items
+  //   group   true for the "Not in navigation" bucket
+  // finishTree() then sets depth (0 = top level), sorted children and total
+  // (sitemap pages in the subtree, including the node itself).
+  function makeNode(name, parent, extra) {
+    return {
+      name, parent, href: '', link: '', page: null, inNav: false, source: 'path',
+      order: Infinity, group: false, depth: 0, children: new Map(), total: 0, ...extra,
+    };
+  }
+
+  function setPage(node, u) {
+    if (node.page) return;          // "/about" and "/about/" share a node; first wins
+    node.page = u;
+    node.link = u.loc;
+    if (!node.href) node.href = u.loc;
+  }
+
+  function finishTree(root) {
+    (function finish(node, depth) {
+      node.depth = depth;
+      node.children = [...node.children.values()].sort((a, b) =>
+        a.order - b.order || a.name.localeCompare(b.name, undefined, { numeric: true }));
+      node.total = node.page ? 1 : 0;
+      for (const c of node.children) node.total += finish(c, depth + 1);
+      return node.total;
+    })(root, -1);
+  }
+
+  // Builds a hierarchy from page URLs alone. Sitemaps carry no parent/child data, so
+  // the structure comes from URL paths: root -> host -> path segments (-> ?query).
   // Returns { root, nodeOf } with nodeOf mapping each loc to its node.
   function buildTree(urls) {
-    const makeNode = (name, href, parent) => ({
-      name, href, parent, depth: parent ? parent.depth + 1 : -1,
-      page: null, children: new Map(), total: 0,
-    });
-    const root = makeNode('', '', null);
+    const root = makeNode('', null);
     const nodeOf = new Map();
 
     for (const u of urls) {
@@ -200,29 +229,132 @@
         href = i === 0 ? url.origin + '/' : href + seg + '/';
         let child = node.children.get(seg);
         if (!child) {
-          child = makeNode(i === 0 ? seg : decodeSegment(seg), href, node);
+          child = makeNode(i === 0 ? seg : decodeSegment(seg), node, { href });
           node.children.set(seg, child);
         }
         node = child;
       });
-      // "/about" and "/about/" land on the same node; the first one wins.
-      if (!node.page) {
-        node.page = u;
-        node.href = u.loc;
-      }
+      setPage(node, u);
       nodeOf.set(u.loc, node);
     }
 
-    (function finish(node) {
-      node.children = [...node.children.values()]
-        .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-      node.total = node.page ? 1 : 0;
-      for (const c of node.children) node.total += finish(c);
-      return node.total;
-    })(root);
-
+    finishTree(root);
     return { root, nodeOf };
   }
 
-  global.Sitemap = { discover, crawl, parse, buildTree };
+  const bareHost = host => host.replace(/^www\./i, '').toLowerCase();
+
+  // Identity of a page that ignores http/https, www. and trailing slashes.
+  function pageKey(url) {
+    return bareHost(url.host) + url.pathname.replace(/\/+$/, '') + url.search;
+  }
+
+  // pageKey() of the first n segments, where segs may end with a "?query" segment.
+  function prefixKey(host, segs, n) {
+    const parts = segs.slice(0, n);
+    const query = parts.length && parts[parts.length - 1].startsWith('?') ? parts.pop() : '';
+    return host + (parts.length ? '/' + parts.join('/') : '') + query;
+  }
+
+  // Builds the tree from the site's main menu, then places every sitemap URL under it:
+  //   root -> site (home page) -> menu items (in menu order) -> dropdown items
+  // contentLinks (optional) maps a menu page URL to links found inside that page.
+  // A sitemap URL goes to the menu node with the same address, else under the menu
+  // node with the longest matching path prefix, else into "Not in navigation".
+  // Menu items: [{ label, url|null, children }]. Returns { root, nodeOf }.
+  function buildNavTree(menuItems, urls, origin, contentLinks) {
+    const site = new URL(origin);
+    const siteHost = bareHost(site.host);
+    const root = makeNode('', null);
+    const home = makeNode(site.hostname, root, { href: site.origin + '/', link: site.origin + '/', order: 0 });
+    root.children.set('site', home);
+
+    const index = new Map([[pageKey(site), home]]);   // pageKey -> node
+    const nodeOf = new Map();
+    let seq = 0;
+
+    function addLinked(parent, item, source) {
+      let url = null;
+      try { if (item.url) url = new URL(item.url); } catch (_) { /* label only */ }
+      const key = url && pageKey(url);
+      let node = key && index.get(key);
+      if (node) {
+        if (source === 'nav') node.inNav = true;
+      } else {
+        const name = item.label ||
+          (url ? decodeSegment(url.pathname.split('/').filter(Boolean).pop() || url.hostname) : '(untitled)');
+        node = makeNode(name, parent, {
+          href: url ? url.href : '', link: url ? url.href : '',
+          inNav: source === 'nav', source, order: seq++,
+        });
+        parent.children.set('item' + node.order, node);
+        if (key) index.set(key, node);
+      }
+      for (const c of item.children || []) addLinked(node, c, source);
+      return node;
+    }
+
+    for (const item of menuItems) addLinked(home, item, 'nav');
+    if (contentLinks) {
+      for (const [pageUrl, links] of contentLinks) {
+        let parent;
+        try { parent = index.get(pageKey(new URL(pageUrl))); } catch (_) { continue; }
+        if (parent) for (const l of links) addLinked(parent, l, 'content');
+      }
+    }
+
+    const unlisted = makeNode('Not in navigation', home, { group: true, order: Number.MAX_SAFE_INTEGER });
+    home.children.set('unlisted', unlisted);
+
+    for (const u of urls) {
+      let url;
+      try { url = new URL(u.loc); } catch (_) { continue; }
+      let node = index.get(pageKey(url));
+      if (!node) {
+        const host = bareHost(url.host);
+        const segs = url.pathname.split('/').filter(Boolean);
+        if (url.search) segs.push(url.search);
+
+        // Deepest existing ancestor. The home page is skipped on purpose, otherwise
+        // every page would count as being "under" it.
+        let start = 0;
+        let parent = null;
+        for (let n = segs.length - 1; n > 0; n--) {
+          parent = index.get(prefixKey(host, segs, n));
+          if (parent) { start = n; break; }
+        }
+        if (!parent) {
+          parent = unlisted;
+          if (host !== siteHost) {
+            const hostKey = 'host:' + host;
+            if (!unlisted.children.has(hostKey)) {
+              unlisted.children.set(hostKey, makeNode(url.hostname, unlisted, { href: url.origin + '/' }));
+            }
+            parent = unlisted.children.get(hostKey);
+          }
+        }
+
+        node = parent;
+        for (let j = start; j < segs.length; j++) {
+          const seg = segs[j];
+          let child = node.children.get('seg:' + seg);
+          if (!child) {
+            const href = url.origin + '/' + segs.slice(0, j + 1).join('/') + '/';
+            child = makeNode(decodeSegment(seg), node, { href });
+            node.children.set('seg:' + seg, child);
+            index.set(prefixKey(host, segs, j + 1), child);
+          }
+          node = child;
+        }
+      }
+      setPage(node, u);
+      nodeOf.set(u.loc, node);
+    }
+
+    if (!unlisted.children.size) home.children.delete('unlisted');
+    finishTree(root);
+    return { root, nodeOf };
+  }
+
+  global.Sitemap = { discover, crawl, parse, buildTree, buildNavTree };
 })(globalThis);

@@ -3,7 +3,8 @@
 const RENDER_LIMIT = 1000;          // max rows rendered per list / per tree level
 const TREE_EXPAND_LIMIT = 3000;     // max pages "Expand all" will render
 const FILTER_EXPAND_LIMIT = 50;     // auto-expand filtered branches with at most this many matches
-const VIEW_KEY = 'fetchmap.view';
+const DIAGRAM_LIMIT = 1500;         // max boxes in an exported diagram
+const PREFS_KEY = 'fetchmap.prefs';
 
 const $ = id => document.getElementById(id);
 const els = {
@@ -23,13 +24,28 @@ const els = {
   viewList: $('view-list'),
   viewTree: $('view-tree'),
   treeTools: $('tree-tools'),
+  srcNav: $('src-nav'),
+  srcPath: $('src-path'),
+  navOptions: $('nav-options'),
+  deepScan: $('deep-scan'),
 };
 
-let origin = '';
+let origin = '';          // origin of the active tab
+let siteOrigin = '';      // origin of the site being mapped
+let tabId = null;
 let allUrls = [];
-let tree = null;    // { root, nodeOf }, built on first use after each fetch
-let view = 'list';
-try { if (localStorage.getItem(VIEW_KEY) === 'tree') view = 'tree'; } catch (_) { /* storage unavailable */ }
+let navMenu = null;       // { items, where } from Nav.extractMenu, or null
+let contentLinks = null;  // deep scan results: Map(pageUrl -> links)
+let navTree = null;       // built lazily; reset whenever their inputs change
+let pathTree = null;
+let openNodes = new Set();  // tree nodes currently expanded, used by the diagram export
+
+const prefs = { view: 'list', source: 'nav', deep: false };
+try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS_KEY) || '{}')); } catch (_) { /* storage unavailable */ }
+
+function savePrefs() {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch (_) { /* storage unavailable */ }
+}
 
 function setStatus(text, kind = '') {
   els.status.textContent = text;
@@ -45,18 +61,34 @@ function filteredUrls() {
   return q ? allUrls.filter(u => u.loc.toLowerCase().includes(q)) : allUrls;
 }
 
+function activeSource() {
+  return prefs.source === 'nav' && navMenu ? 'nav' : 'path';
+}
+
 function render() {
   const count = filteredUrls().length;
   els.urlCount.textContent = count === allUrls.length
     ? `${allUrls.length} URLs`
     : `${count} of ${allUrls.length} URLs`;
 
-  const isTree = view === 'tree';
+  const isTree = prefs.view === 'tree';
+  const source = activeSource();
   els.viewList.setAttribute('aria-pressed', String(!isTree));
   els.viewTree.setAttribute('aria-pressed', String(isTree));
+  els.srcNav.setAttribute('aria-pressed', String(source === 'nav'));
+  els.srcPath.setAttribute('aria-pressed', String(source === 'path'));
+  els.srcNav.disabled = !navMenu;
+  els.srcNav.title = navMenu
+    ? `Main navigation menu (${navMenu.where}), with sitemap pages placed under it`
+    : 'No navigation menu found on this site';
+  els.deepScan.checked = prefs.deep;
+
   els.urlList.hidden = isTree;
   els.urlTree.hidden = !isTree;
   els.treeTools.hidden = !isTree;
+  els.navOptions.hidden = !isTree || source !== 'nav';
+  for (const b of document.querySelectorAll('.tree-only')) b.hidden = !isTree;
+
   if (isTree) renderTree();
   else renderUrls();
 }
@@ -93,11 +125,14 @@ function renderUrls() {
 // ---- Tree ----
 
 function getTree() {
-  return tree ??= Sitemap.buildTree(allUrls);
+  if (activeSource() === 'nav') {
+    return navTree ??= Sitemap.buildNavTree(navMenu.items, allUrls, siteOrigin, prefs.deep ? contentLinks : null);
+  }
+  return pathTree ??= Sitemap.buildTree(allUrls);
 }
 
 function isMatch(node, q) {
-  return !!node.page && node.page.loc.toLowerCase().includes(q);
+  return !!node.link && (node.link.toLowerCase().includes(q) || node.name.toLowerCase().includes(q));
 }
 
 // Records, for every node, how many matching pages its subtree holds.
@@ -130,11 +165,11 @@ function treeContext() {
   };
 }
 
-// Folds chains of URL-less single-child folders into one row, e.g. "blog/2024".
+// Folds chains of link-less single-child folders into one row, e.g. "blog/2024".
 function compact(node, ctx) {
   let name = node.name;
   let kids = ctx.kidsOf(node);
-  while (node.depth > 0 && !node.page && kids.length === 1 && kids[0].children.length) {
+  while (node.depth > 0 && !node.link && !node.group && kids.length === 1 && kids[0].children.length) {
     node = kids[0];
     name += '/' + node.name;
     kids = ctx.kidsOf(node);
@@ -142,31 +177,49 @@ function compact(node, ctx) {
   return { node, name, kids };
 }
 
+function tagsOf(node) {
+  const tags = [];
+  if (node.source === 'content') tags.push(['found', 'in page', 'Found by deep scan inside a main page']);
+  if (node.link && !node.page && !node.group) {
+    tags.push(['warn', 'no sitemap', 'Linked from the site but missing from the sitemap']);
+  }
+  return tags;
+}
+
 function treeRow(node, name, count) {
   const row = document.createElement('div');
-  row.className = 'row';
+  row.className = 'row' + (node.group ? ' group' : '');
 
   let label;
-  if (node.page) {
+  if (node.link) {
     label = document.createElement('a');
-    label.href = node.page.loc;
+    label.href = node.link;
     label.target = '_blank';
     label.rel = 'noopener';
-    label.title = node.page.loc;
+    label.title = node.link;
   } else {
     label = document.createElement('span');
-    label.classList.add('virtual');
-    label.title = 'Not in sitemap';
+    if (!node.group) {
+      label.classList.add('virtual');
+      label.title = node.source === 'nav' ? 'Menu heading (no link)' : 'Not in sitemap';
+    }
   }
   label.classList.add('name');
   label.textContent = name;
   row.appendChild(label);
 
+  for (const [cls, text, title] of tagsOf(node)) {
+    const tag = document.createElement('span');
+    tag.className = 'tag ' + cls;
+    tag.textContent = text;
+    tag.title = title;
+    row.appendChild(tag);
+  }
   if (count) {
     const badge = document.createElement('span');
     badge.className = 'badge';
     badge.textContent = count;
-    badge.title = `${count} page${count === 1 ? '' : 's'} below`;
+    badge.title = `${count} sitemap page${count === 1 ? '' : 's'} below`;
     row.appendChild(badge);
   }
   if (node.page?.lastmod) {
@@ -214,20 +267,29 @@ function treeItem(start, ctx, open) {
   };
   if (open(node)) {
     details.open = true;
+    openNodes.add(node);
     renderKids();
   }
-  details.addEventListener('toggle', () => { if (details.open) renderKids(); });
+  details.addEventListener('toggle', () => {
+    if (details.open) {
+      openNodes.add(node);
+      renderKids();
+    } else {
+      openNodes.delete(node);
+    }
+  });
   li.appendChild(details);
   return li;
 }
 
-// mode: 'default' (hosts open, plus small filtered branches), 'all' or 'none'.
+// mode: 'default' (site/hosts open, plus small filtered branches), 'all' or 'none'.
 function renderTree(mode = 'default') {
   const ctx = treeContext();
   const open = mode === 'all' ? () => true
     : mode === 'none' || !ctx.q ? node => node.depth === 0
     : node => node.depth === 0 || ctx.pagesIn(node) <= FILTER_EXPAND_LIMIT;
 
+  openNodes = new Set();
   const kids = ctx.kidsOf(ctx.root);
   els.urlTree.replaceChildren(...treeChildren(kids, ctx, open).childNodes);
 }
@@ -241,11 +303,45 @@ function expandAll() {
   renderTree('all');
 }
 
-function setView(next) {
-  view = next;
-  try { localStorage.setItem(VIEW_KEY, view); } catch (_) { /* storage unavailable */ }
-  render();
+// ---- Navigation menu ----
+
+// Reads the menu from the live tab when it shows the mapped site (sees menus built by
+// JavaScript), otherwise from the fetched home page HTML.
+async function loadMenu() {
+  if (tabId != null && origin === siteOrigin) {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['nav.js'] });
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => globalThis.Nav.extractMenu(document, location.href),
+      });
+      if (res?.result) return res.result;
+    } catch (_) { /* page can't be scripted; fall back to fetching */ }
+  }
+  return Nav.fetchMenu(siteOrigin);
 }
+
+// Main pages for deep scan: linked top-level items (except home), or the direct
+// children of top-level headings that have no link of their own.
+function mainPageUrls() {
+  const urls = [];
+  for (const item of navMenu.items) {
+    for (const i of item.url ? [item] : item.children) {
+      if (i.url && new URL(i.url).pathname !== '/' && !urls.includes(i.url)) urls.push(i.url);
+    }
+  }
+  return urls;
+}
+
+async function runDeepScan() {
+  if (!navMenu || contentLinks) return;
+  const urls = mainPageUrls();
+  contentLinks = await Nav.scanPages(urls, setStatus);
+  const found = [...contentLinks.values()].reduce((n, l) => n + l.length, 0);
+  setStatus(`Deep scan: ${found} links found in ${urls.length} main pages.`, 'ok');
+}
+
+// ---- Fetch ----
 
 function renderSitemaps(sitemaps) {
   els.sitemapCount.textContent = sitemaps.length;
@@ -278,14 +374,17 @@ async function run(manualUrl) {
   els.results.hidden = true;
   els.sitemapsSection.hidden = true;
   allUrls = [];
-  tree = null;
+  navMenu = null;
+  contentLinks = null;
+  navTree = pathTree = null;
+  siteOrigin = manualUrl ? new URL(manualUrl).origin : origin;
 
   try {
     let roots;
     if (manualUrl) {
       roots = [manualUrl];
     } else {
-      roots = await Sitemap.discover(origin, setStatus);
+      roots = await Sitemap.discover(siteOrigin, setStatus);
       if (!roots.length) {
         setStatus('No sitemap found. Enter a sitemap URL above to fetch it manually.', 'error');
         return;
@@ -302,10 +401,17 @@ async function run(manualUrl) {
       return;
     }
 
+    setStatus('Reading navigation menu…');
+    navMenu = await loadMenu();
+    if (navMenu && prefs.deep) await runDeepScan();
+
     const failed = sitemaps.filter(s => s.error).length;
     let msg = `Found ${urls.length} URLs in ${sitemaps.length} sitemap${sitemaps.length === 1 ? '' : 's'}.`;
     if (failed) msg += ` ${failed} failed.`;
     if (capped) msg += ' Sitemap limit reached; some may be skipped.';
+    msg += navMenu
+      ? ` Menu: ${navMenu.items.length} main items.`
+      : ' No navigation menu found; tree uses URL paths.';
     setStatus(msg, 'ok');
 
     els.results.hidden = false;
@@ -320,14 +426,14 @@ async function run(manualUrl) {
 // ---- Export ----
 
 function hostSlug() {
-  try { return new URL(origin).hostname.replace(/[^a-z0-9.-]/gi, '_'); } catch (_) { return 'sitemap'; }
+  try { return new URL(siteOrigin || origin).hostname.replace(/[^a-z0-9.-]/gi, '_'); } catch (_) { return 'sitemap'; }
 }
 
 function download(content, ext, mime) {
-  const blob = new Blob([content], { type: mime });
+  const blob = content instanceof Blob ? content : new Blob([content], { type: mime });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `${hostSlug()}-sitemap${view === 'tree' ? '-tree' : ''}.${ext}`;
+  a.download = `${hostSlug()}-sitemap${prefs.view === 'tree' ? '-tree' : ''}.${ext}`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
@@ -336,14 +442,24 @@ function csvCell(v) {
   return /[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
 
-// Indented outline: pages as full URLs, virtual levels as "segment/ (not in sitemap)".
+function outlineLine(node, source) {
+  if (node.group) return node.name;
+  let text = !node.link ? `${node.name}/`
+    : source === 'nav' ? `${node.name} — ${node.link}`
+    : node.link;
+  if (node.source === 'content') text += ' [found in page]';
+  if (!node.page) text += node.link ? ' [not in sitemap]' : ' (not in sitemap)';
+  return text;
+}
+
+// Indented outline of the (filtered) tree.
 function treeOutline() {
   const ctx = treeContext();
+  const source = activeSource();
   const lines = [];
   (function walk(nodes) {
     for (const n of nodes) {
-      const indent = '  '.repeat(n.depth);
-      lines.push(indent + (n.page ? n.page.loc : `${n.name}/ (not in sitemap)`));
+      lines.push('  '.repeat(n.depth) + outlineLine(n, source));
       walk(ctx.kidsOf(n));
     }
   })(ctx.kidsOf(ctx.root));
@@ -353,7 +469,10 @@ function treeOutline() {
 function treeJson() {
   const ctx = treeContext();
   const toJson = n => {
-    const o = { name: n.name, url: n.page?.loc || null };
+    const o = { name: n.name, url: n.link || null, inSitemap: !!n.page };
+    if (n.inNav) o.inNav = true;
+    if (n.source === 'content') o.foundInPage = true;
+    if (n.group) o.group = true;
     if (n.page?.lastmod) o.lastmod = n.page.lastmod;
     const kids = ctx.kidsOf(n);
     if (kids.length) o.children = kids.map(toJson);
@@ -363,12 +482,76 @@ function treeJson() {
 }
 
 function urlText() {
-  return view === 'tree' ? treeOutline() : filteredUrls().map(u => u.loc).join('\n');
+  return prefs.view === 'tree' ? treeOutline() : filteredUrls().map(u => u.loc).join('\n');
+}
+
+function displayPath(link) {
+  try {
+    const u = new URL(link);
+    return decodeURI(u.pathname + u.search);
+  } catch (_) {
+    return link;
+  }
+}
+
+function diagramStatus(node) {
+  if (!node.link) return 'folder';
+  if (node.source === 'content') return 'found';
+  return node.page ? 'ok' : 'nosm';
+}
+
+// Diagram of the tree as currently shown: collapsed branches become a "+N" badge.
+function diagramModel() {
+  const ctx = treeContext();
+  const toBox = (start, level) => {
+    const { node, name, kids } = compact(start, ctx);
+    const open = kids.length > 0 && openNodes.has(node);
+    return {
+      name,
+      path: node.group ? `${ctx.below(node)} pages` : level === 0 ? node.link || '' : node.link ? displayPath(node.link) : '',
+      kind: level === 0 ? 'root' : node.group ? 'group' : level === 1 ? 'main' : 'sub',
+      status: diagramStatus(node),
+      more: kids.length && !open ? ctx.below(node) || kids.length : 0,
+      children: open ? kids.map(k => toBox(k, level + 1)) : [],
+    };
+  };
+
+  const tops = ctx.kidsOf(ctx.root);
+  const root = tops.length === 1
+    ? toBox(tops[0], 0)
+    : { name: 'Sitemap', path: '', kind: 'root', status: 'ok', more: 0, children: tops.map(t => toBox(t, 1)) };
+
+  const source = activeSource();
+  const parts = [
+    source === 'nav' ? 'Main navigation + sitemap' : 'URL paths from sitemap',
+    new Date().toISOString().slice(0, 10),
+    `${ctx.pagesIn(ctx.root)} pages`,
+  ];
+  if (ctx.q) parts.push(`filter "${ctx.q}"`);
+  return { title: `${hostSlug()} — Site map`, subtitle: parts.join(' · '), root };
+}
+
+async function exportImage(ext) {
+  const model = diagramModel();
+  const boxes = Diagram.countBoxes(model.root);
+  if (boxes > DIAGRAM_LIMIT) {
+    setStatus(`Diagram would have ${boxes} boxes (max ${DIAGRAM_LIMIT}). Collapse some branches or filter first.`, 'error');
+    return;
+  }
+  setStatus('Drawing diagram…');
+  try {
+    const out = await Diagram.render(model);
+    if (ext === 'svg') download(new Blob([out.svg], { type: 'image/svg+xml' }), 'svg');
+    else download(await Diagram.png(out), 'png');
+    setStatus(`Saved ${ext.toUpperCase()} diagram (${boxes} boxes). It shows the tree as currently expanded.`, 'ok');
+  } catch (err) {
+    setStatus('Image export failed: ' + err.message, 'error');
+  }
 }
 
 $('copy-btn').addEventListener('click', async () => {
   await navigator.clipboard.writeText(urlText());
-  setStatus(view === 'tree'
+  setStatus(prefs.view === 'tree'
     ? 'Copied tree outline to clipboard.'
     : `Copied ${filteredUrls().length} URLs to clipboard.`, 'ok');
 });
@@ -379,27 +562,53 @@ $('txt-btn').addEventListener('click', () => {
 
 $('csv-btn').addEventListener('click', () => {
   const { nodeOf } = getTree();
-  const rows = [['url', 'lastmod', 'sitemap', 'depth', 'parent']]
+  const nav = activeSource() === 'nav';
+  const rows = [['url', 'lastmod', 'sitemap', 'depth', 'parent', 'in_nav']]
     .concat(filteredUrls().map(u => {
       const node = nodeOf.get(u.loc);
-      const parent = node?.parent?.depth >= 0 ? node.parent.href : '';
-      return [u.loc, u.lastmod, u.source, node ? String(node.depth) : '', parent];
+      const parent = node?.parent?.depth >= 0 ? node.parent.link || node.parent.href || node.parent.name : '';
+      const inNav = nav ? (node?.inNav ? 'yes' : 'no') : '';
+      return [u.loc, u.lastmod, u.source, node ? String(node.depth) : '', parent, inNav];
     }));
   download(rows.map(r => r.map(csvCell).join(',')).join('\r\n'), 'csv', 'text/csv');
 });
 
 $('json-btn').addEventListener('click', () => {
-  const data = view === 'tree' ? treeJson() : filteredUrls();
+  const data = prefs.view === 'tree' ? treeJson() : filteredUrls();
   download(JSON.stringify(data, null, 2), 'json', 'application/json');
 });
 
+$('png-btn').addEventListener('click', () => exportImage('png'));
+$('svg-btn').addEventListener('click', () => exportImage('svg'));
+
 // ---- Init ----
 
+function setPref(key, value) {
+  prefs[key] = value;
+  savePrefs();
+  render();
+}
+
 els.filter.addEventListener('input', render);
-els.viewList.addEventListener('click', () => setView('list'));
-els.viewTree.addEventListener('click', () => setView('tree'));
+els.viewList.addEventListener('click', () => setPref('view', 'list'));
+els.viewTree.addEventListener('click', () => setPref('view', 'tree'));
+els.srcNav.addEventListener('click', () => setPref('source', 'nav'));
+els.srcPath.addEventListener('click', () => setPref('source', 'path'));
 $('expand-btn').addEventListener('click', expandAll);
 $('collapse-btn').addEventListener('click', () => renderTree('none'));
+
+els.deepScan.addEventListener('change', async () => {
+  prefs.deep = els.deepScan.checked;
+  savePrefs();
+  els.deepScan.disabled = true;
+  try {
+    if (prefs.deep) await runDeepScan();
+    navTree = null;
+    render();
+  } finally {
+    els.deepScan.disabled = false;
+  }
+});
 
 els.form.addEventListener('submit', e => {
   e.preventDefault();
@@ -407,7 +616,7 @@ els.form.addEventListener('submit', e => {
   if (manual) {
     try {
       const u = new URL(manual);
-      if (!origin) origin = u.origin;
+      if (!/^https?:$/.test(u.protocol)) throw new Error();
     } catch (_) {
       setStatus('Invalid URL.', 'error');
       return;
@@ -427,6 +636,7 @@ els.form.addEventListener('submit', e => {
 
   if (url && /^https?:$/.test(url.protocol)) {
     origin = url.origin;
+    tabId = tab.id;
     els.origin.textContent = url.hostname;
     run('');
   } else {

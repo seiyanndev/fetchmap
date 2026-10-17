@@ -38,21 +38,38 @@
         <button id="view-tree" aria-pressed="false">Tree</button>
       </div>
       <div id="tree-tools" class="tree-tools" hidden>
-        <button id="expand-btn">Expand all</button>
-        <button id="collapse-btn">Collapse all</button>
+        <div class="segmented" role="group" aria-label="Tree source">
+          <button id="src-nav" aria-pressed="true" title="Main navigation menu, with sitemap pages placed under it">Menu</button>
+          <button id="src-path" aria-pressed="false" title="Hierarchy from URL paths only">Paths</button>
+        </div>
+        <button id="expand-btn" class="icon" title="Expand all" aria-label="Expand all">+</button>
+        <button id="collapse-btn" class="icon" title="Collapse all" aria-label="Collapse all">−</button>
       </div>
+    </div>
+    <div id="nav-options" class="toolbar nav-options" hidden>
+      <label class="check" title="Also fetch each main page and add the links found in its content">
+        <input type="checkbox" id="deep-scan"> Deep scan main pages
+      </label>
+      <span class="legend">
+        <span class="tag warn">no sitemap</span> menu link missing from sitemap
+        <span class="tag found">in page</span> found by deep scan
+      </span>
     </div>
     <div class="toolbar actions">
       <button id="copy-btn">Copy</button>
       <button id="txt-btn">TXT</button>
       <button id="csv-btn">CSV</button>
       <button id="json-btn">JSON</button>
+      <button id="png-btn" class="tree-only" title="Download the tree as a PNG diagram (follows what is expanded)" hidden>PNG</button>
+      <button id="svg-btn" class="tree-only" title="Download the tree as an SVG diagram (follows what is expanded)" hidden>SVG</button>
     </div>
     <ul id="url-list"></ul>
     <ul id="url-tree" class="tree" hidden></ul>
   </section>
 
   <script src="sitemap.js"></script>
+  <script src="nav.js"></script>
+  <script src="diagram.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>
